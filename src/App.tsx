@@ -72,7 +72,7 @@ import {
   setDoc,
   getDocs
 } from "firebase/firestore";
-import { ref, uploadString, getDownloadURL } from "firebase/storage";
+import { ref, uploadString, getDownloadURL, uploadBytes } from "firebase/storage";
 import { storage } from "./firebase";
 
 // --- Firestore Error Handling ---
@@ -746,12 +746,15 @@ const Generator = () => {
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const [isRedirecting, setIsRedirecting] = useState(false);
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
+  const [storageImageUrl, setStorageImageUrl] = useState<string | null>(null);
 
   const uploadImageToStorage = async (base64Data: string, path: string) => {
     try {
       const storageRef = ref(storage, path);
-      // Data is in format "data:image/png;base64,..."
-      const result = await uploadString(storageRef, base64Data, 'data_url');
+      // Convert base64 to blob for more efficient upload
+      const response = await fetch(base64Data);
+      const blob = await response.blob();
+      const result = await uploadBytes(storageRef, blob);
       return await getDownloadURL(result.ref);
     } catch (error) {
       console.error("Error uploading image to storage:", error);
@@ -821,6 +824,7 @@ const Generator = () => {
     setError("");
     setResults([]);
     setGeneratedImageUrl(null);
+    setStorageImageUrl(null);
 
     try {
       const apiKey = settings?.geminiApiKey || process.env.GEMINI_API_KEY || "";
@@ -858,7 +862,7 @@ DESCRIPTION: [Deskripsi SEO Pinterest, maks 500 karakter]
 ALT_TEXT: [Teks alternatif untuk aksesibilitas, jelaskan apa yang ada di gambar secara mendetail, maks 500 karakter]
 KEYWORDS: [5-10 keywords dipisahkan koma]
 BOARD_NAME: [Rekomendasi nama board]
-IMAGE_GENERATION_PROMPT: [Prompt detail untuk menghasilkan gambar sesuai KONSEP VISUAL di atas. Pastikan produk SAMA PERSIS dengan referensi. Jika ada orang, pastikan wanita Asia yang modis. Fokus pada pencahayaan, komposisi vertikal (rasio 2:3), dan gaya estetis Pinterest. Fokus pada pencahayaan, komposisi vertikal, dan teks overlay.]
+IMAGE_GENERATION_PROMPT: [Prompt detail untuk menghasilkan gambar sesuai KONSEP VISUAL di atas. Pastikan produk SAMA PERSIS dengan referensi. Jika ada orang, pastikan wanita Asia yang modis. Fokus pada pencahayaan, komposisi vertikal (rasio 2:3), dan gaya estetis Pinterest. TAMBAHKAN TEKS OVERLAY yang menjual (selling) dengan font modern, tebal, dan bersih (seperti League Spartan atau Montserrat). Teks harus proporsional (tidak terlalu kecil/besar), diletakkan di area yang tidak menutupi produk, dan menggunakan warna kontras yang estetik. Teks berisi headline singkat dari TITLE.]
 
 Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
       } else {
@@ -936,6 +940,14 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
         }
       }
 
+      // Immediate redirection if auto-save is on, don't wait for background upload
+      if (user && autoSaveToPlanner) {
+        showToast("Berhasil generate! Menyimpan & Mengalihkan ke Planner...");
+        setTimeout(() => {
+          navigate("/scheduler");
+        }, 1000);
+      }
+
       // Background tasks: Save to history and planner
       if (user) {
         // Capture current state values for background task
@@ -957,6 +969,10 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
 
             // CRITICAL: Never save raw base64 to Firestore if upload failed
             const imageUrlForFirestore = finalStorageUrl || (imageToSave && imageToSave.length < 1000 ? imageToSave : "");
+            
+            if (finalStorageUrl) {
+              setStorageImageUrl(finalStorageUrl);
+            }
 
             await addDoc(historyRef, {
               uid: user.uid,
@@ -1037,8 +1053,9 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
     
     setSaveToPlannerStatus("saving");
     
-    // Capture current image and product name
+    // Use cached storage URL if available to avoid re-uploading
     const imageToSave = generatedImageUrl;
+    const currentStorageUrl = storageImageUrl;
     const currentProductName = productName;
     const currentContentType = contentType;
 
@@ -1049,22 +1066,24 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
       tomorrow.setDate(tomorrow.getDate() + 1);
       tomorrow.setHours(10, 0, 0, 0);
 
-      let finalStorageUrl = null;
-      if (imageToSave && imageToSave.startsWith('data:')) {
+      let imageUrlForFirestore = currentStorageUrl;
+      
+      if (!imageUrlForFirestore && imageToSave && imageToSave.startsWith('data:')) {
+        setStatusMessage("Mengunggah gambar...");
         const fileName = `planner/${user.uid}/${Date.now()}.png`;
-        finalStorageUrl = await uploadImageToStorage(imageToSave, fileName);
+        imageUrlForFirestore = await uploadImageToStorage(imageToSave, fileName);
+        if (imageUrlForFirestore) setStorageImageUrl(imageUrlForFirestore);
       }
 
-      // CRITICAL: Never save raw base64 to Firestore if upload failed
-      const imageUrlForFirestore = finalStorageUrl || (imageToSave && imageToSave.length < 1000 ? imageToSave : "");
-
+      setStatusMessage("Menyimpan ke Planner...");
+      
       let postData: any = {
         uid: user.uid,
-        status: "pending", // Changed from "ready" to match rule expectations
+        status: "pending",
         scheduledAt: tomorrow,
         createdAt: serverTimestamp(),
         link: "",
-        imageUrl: imageUrlForFirestore,
+        imageUrl: imageUrlForFirestore || "",
       };
 
       if (currentContentType === "full") {
@@ -1092,8 +1111,12 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
       await addDoc(postsRef, postData);
       
       setSaveToPlannerStatus("success");
-      showToast("Berhasil disimpan ke Planner!");
-      setTimeout(() => setSaveToPlannerStatus("idle"), 3000);
+      showToast("Berhasil disimpan ke Planner! Mengalihkan...");
+      
+      setTimeout(() => {
+        setSaveToPlannerStatus("idle");
+        navigate("/scheduler");
+      }, 1500);
     } catch (err) {
       console.error("Manual Save Error:", err);
       setSaveToPlannerStatus("error");
@@ -1135,6 +1158,7 @@ Pastikan label (TITLE:, CAPTION:, dll) ada di awal baris.`;
             onClick={() => {
               setResults([]);
               setGeneratedImageUrl(null);
+              setStorageImageUrl(null);
               setProductName("");
               setSelectedImage(null);
             }}
